@@ -8,50 +8,40 @@ const nlp = winkNLP(model);
 const its = nlp.its;
 
 export async function POST(req) {
-  console.log("--- Starting Analysis ---");
   try {
     const formData = await req.formData();
     const file = formData.get('file');
-    if (!file) throw new Error("No file found in request");
-
-    console.log(`File received: ${file.name} (${file.size} bytes)`);
-
     const buffer = Buffer.from(await file.arrayBuffer());
     const zip = new AdmZip(buffer);
 
-    // 1. Find the OPF file
-    console.log("Step 1: Finding OPF...");
     const containerEntry = zip.getEntry('META-INF/container.xml');
-    if (!containerEntry) throw new Error("Invalid EPUB: Missing container.xml");
-    
     const containerXml = containerEntry.getData().toString();
     const containerObj = await parseStringPromise(containerXml);
     const opfPath = containerObj.container.rootfiles[0].rootfile[0].$['full-path'];
-    console.log(`OPF found at: ${opfPath}`);
-
-    // 2. Extract text
-    console.log("Step 2: Extracting text from chapters...");
+    
     let fullText = "";
     const zipEntries = zip.getEntries();
-    let chapterCount = 0;
+    // Processing first 15 chapters for better depth
+    const htmlFiles = zipEntries.filter(e => e.entryName.endsWith('.xhtml') || e.entryName.endsWith('.html')).slice(0, 15);
 
-    zipEntries.forEach((entry) => {
-      if (entry.entryName.endsWith('.xhtml') || entry.entryName.endsWith('.html')) {
-        const html = entry.getData().toString();
-        const text = html.replace(/<[^>]*>/g, ' '); 
-        fullText += text + " ";
-        chapterCount++;
-      }
+    htmlFiles.forEach((entry) => {
+      const html = entry.getData().toString();
+      const text = html.replace(/<[^>]*>/g, ' '); 
+      fullText += text + " ";
     });
-    console.log(`Extracted text from ${chapterCount} chapters. Total length: ${fullText.length} chars.`);
 
-    if (fullText.length < 100) throw new Error("Book seems empty or protected by DRM.");
+    // --- CUSTOM NLP CONFIGURATION ---
+    // Define relationship terms to track
+    const relationships = [
+      'wife', 'husband', 'mother', 'mom', 'father', 'dad', 
+      'sister', 'brother', 'daughter', 'son', 'grandmother', 'grandfather',
+      'aunt', 'uncle', 'cousin', 'fiance', 'fiancé'
+    ];
 
-    // 3. Process with NLP
-    console.log("Step 3: Running NLP Analysis (this is the heavy part)...");
     const doc = nlp.readDoc(fullText);
     const characters = {};
 
+    // 1. Extract Proper Names (Standard NER)
     doc.entities().filter(e => e.out(its.type) === 'PERSON').each((e) => {
       const name = e.out().trim();
       if (name.length > 2) {
@@ -60,14 +50,38 @@ export async function POST(req) {
       }
     });
 
-    // Rule-based description
+    // 2. Extract Relationship Characters
+    // We look for "my [term]" or "[term]" appearing as a subject
+    doc.tokens().each((token) => {
+      const word = token.out().toLowerCase();
+      if (relationships.includes(word)) {
+        const displayName = `The ${word.charAt(0).toUpperCase() + word.slice(1)}`;
+        if (!characters[displayName]) {
+          characters[displayName] = { name: displayName, traits: new Set(), count: 0 };
+        }
+        characters[displayName].count++;
+      }
+    });
+
+    // 3. Extract Traits (Broad Adjective Mapping)
     doc.sentences().each((sent) => {
-      const sentText = sent.out();
+      const tokens = sent.tokens().out(its.value);
+      const lowerTokens = tokens.map(t => t.toLowerCase());
+      const pos = sent.tokens().out(its.pos);
+
       Object.keys(characters).forEach(name => {
-        if (sentText.includes(name)) {
+        const searchTerms = name.toLowerCase().split(' '); // e.g. "The Wife" -> ["the", "wife"]
+        
+        // Check if any part of the name/title is in this sentence
+        const foundMatch = searchTerms.some(term => term.length > 2 && lowerTokens.includes(term));
+
+        if (foundMatch) {
           sent.tokens().filter(t => t.out(its.pos) === 'ADJ').each(adj => {
             const trait = adj.out().toLowerCase();
-            if (trait.length > 3) characters[name].traits.add(trait);
+            const noise = ['other', 'many', 'more', 'same', 'such', 'little', 'own', 'new', 'old'];
+            if (trait.length > 3 && !noise.includes(trait)) {
+              characters[name].traits.add(trait);
+            }
           });
         }
       });
@@ -75,13 +89,16 @@ export async function POST(req) {
 
     const result = Object.values(characters)
       .filter(c => c.count > 1 && c.traits.size > 0)
-      .map(c => ({ name: c.name, traits: Array.from(c.traits).slice(0, 5) }));
+      .map(c => ({
+        name: c.name,
+        traits: Array.from(c.traits).slice(0, 8)
+      }))
+      .sort((a, b) => b.traits.length - a.traits.length)
+      .slice(0, 20);
 
-    console.log(`Analysis complete. Found ${result.length} characters.`);
     return NextResponse.json({ characters: result });
 
   } catch (error) {
-    console.error("ANALYSIS ERROR:", error.message);
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
 }
